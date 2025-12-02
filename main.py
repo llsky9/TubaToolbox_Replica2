@@ -10,7 +10,8 @@ from PyQt5.QtWidgets import (
     QListWidget, QListWidgetItem, QScrollArea, 
     QFrame, QFileIconProvider, QVBoxLayout,
     QMessageBox, QInputDialog, QMenu, QAction,
-    QDialog, QLineEdit, QPushButton, QGridLayout, QFileDialog
+    QDialog, QLineEdit, QPushButton, QGridLayout, QFileDialog,
+    QAbstractItemView
 )
 from PyQt5.QtCore import Qt, QFileInfo, QSize, QPoint, QRect, QTimer
 from PyQt5.QtGui import QPixmap, QFont, QCursor
@@ -199,9 +200,6 @@ class ResponsiveContainer(QWidget):
         rel_x = pos.x() - start_x
         rel_y = pos.y() - 10
         
-        # 加上半个item的宽高作为容错，使得判定点更自然
-        # 这里其实直接算所在的行列
-        
         col = round(rel_x / (w + sx))
         row = round(rel_y / (h + sy))
         
@@ -366,12 +364,11 @@ class ToolItem(QWidget):
             self.parent_win.update_description("") 
         super().leaveEvent(event)
 
-    # --- 核心修改：鼠标事件处理 (增加拖拽逻辑) ---
+    # --- 鼠标事件处理 (增加拖拽逻辑) ---
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
-            # 记录按下的相对位置，用于计算移动偏移
             self.drag_start_pos = event.pos() 
-            self.is_dragging = False # 重置状态
+            self.is_dragging = False 
             
             current_time = time.time() * 1000
             if current_time - self.last_left_click > self.click_interval:
@@ -394,43 +391,33 @@ class ToolItem(QWidget):
         if not self.drag_start_pos:
             return
 
-        # 计算移动距离，判断是否构成拖拽
         dist = (event.pos() - self.drag_start_pos).manhattanLength()
         
-        # 只有移动超过一定像素，才判定为拖拽，避免手抖
         if not self.is_dragging:
             if dist > 10:
                 self.is_dragging = True
                 self.setStyleSheet(self.style_dragging)
-                self.raise_() # 将控件置于顶层
+                self.raise_() 
                 
         if self.is_dragging:
-            # 移动控件 (相对于父容器)
-            # mapToParent(event.pos()) 是鼠标当前在父容器的坐标
-            # self.drag_start_pos 是鼠标在控件内的偏移
             new_pos = self.mapToParent(event.pos()) - self.drag_start_pos
             
-            # 简单的边界限制，防止拖出太远
             parent_rect = self.parent().rect()
             if parent_rect.contains(new_pos):
                  self.move(new_pos)
             else:
-                self.move(new_pos) # 允许拖出一点，体验更好
+                self.move(new_pos) 
             
-            # 调用父容器的重排逻辑
-            # 我们传递控件中心点坐标给父容器计算
             center_pos = self.pos() + QPoint(self.width() // 2, self.height() // 2)
             self.parent().reorder_item(self, center_pos)
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.LeftButton:
             if self.is_dragging:
-                # 拖拽结束
                 self.is_dragging = False
-                self.setStyleSheet(self.style_hover) # 恢复悬停样式
-                self.parent().finalize_drag(self) # 吸附归位
+                self.setStyleSheet(self.style_hover) 
+                self.parent().finalize_drag(self) 
             else:
-                # 是普通的点击（双击逻辑由时间间隔判断）
                 current_time = time.time() * 1000
                 if current_time - self.last_left_click < self.click_interval:
                     self.parent_win.launch_app(self.path)
@@ -575,9 +562,17 @@ class MainWindow(QMainWindow):
         self.category_list.setFocusPolicy(Qt.NoFocus)
         self.category_list.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         
+        # --- 新增: 启用分类列表的拖拽排序 ---
+        self.category_list.setDragEnabled(True)
+        self.category_list.setAcceptDrops(True)
+        self.category_list.setDragDropMode(QAbstractItemView.InternalMove)
+        self.category_list.setDefaultDropAction(Qt.MoveAction)
+        # 连接模型移动信号，用于同步数据顺序
+        self.category_list.model().rowsMoved.connect(self.on_category_reordered)
+
         cat_f_size = USER_CONFIG["FONT_SIZES"].get("CATEGORY", 15)
         self.category_list.setStyleSheet(f"""
-            QListWidget {{ background: transparent; border: none; }}
+            QListWidget {{ background: transparent; border: none; outline: 0; }}
             QListWidget::item {{
                 height: 45px;
                 color: rgba(255,255,255,0.7);
@@ -698,6 +693,8 @@ class MainWindow(QMainWindow):
             with open(json_path, 'r', encoding='utf-8') as f:
                 self.data = json.load(f)
             
+            # 清空列表防止重载时重复
+            self.category_list.clear()
             for category in self.data.keys():
                 item = QListWidgetItem(category)
                 item.setTextAlignment(Qt.AlignCenter) 
@@ -757,6 +754,19 @@ class MainWindow(QMainWindow):
                 
                 btn = ToolItem(name, desc, path, tool_str, self) 
                 self.responsive_container.add_tool(btn)
+    
+    def on_category_reordered(self, parent, start, end, destination, row):
+        """当分类被拖动重新排序后，同步内存数据顺序"""
+        new_data = {}
+        # 遍历 ListWidget 的当前顺序来重建字典
+        for i in range(self.category_list.count()):
+            cat_name = self.category_list.item(i).text()
+            if cat_name in self.data:
+                new_data[cat_name] = self.data[cat_name]
+        
+        self.data = new_data
+        self.is_dirty = True
+        # print("Debug: Category order synced.")
 
     def on_category_context_menu(self, point):
         item = self.category_list.itemAt(point)
@@ -795,7 +805,17 @@ class MainWindow(QMainWindow):
             if new_category in self.data:
                 QMessageBox.warning(self, "警告", "新分类名称已存在！")
                 return
-            self.data[new_category] = self.data.pop(old_category)
+            
+            # 使用有序字典方式保持原位置（简单实现为重新插入，稍微改变底层顺序，但界面已改）
+            # 最好的方式是直接替换Key但保持顺序
+            new_data = {}
+            for k, v in self.data.items():
+                if k == old_category:
+                    new_data[new_category] = v
+                else:
+                    new_data[k] = v
+            self.data = new_data
+            
             item.setText(new_category)
             self.is_dirty = True
             
@@ -814,9 +834,8 @@ class MainWindow(QMainWindow):
             self.responsive_container.clear_tools()
             self.update_description("")
             
-    # --- 软件管理方法 (含新的排序保存逻辑) ---
+    # --- 软件管理方法 ---
     def save_tools_order(self, new_tools_list):
-        """当图标在容器中被重新排序后调用此方法"""
         current_item = self.category_list.currentItem()
         if not current_item: return
         
@@ -824,7 +843,6 @@ class MainWindow(QMainWindow):
         if category in self.data:
             self.data[category] = new_tools_list
             self.is_dirty = True
-            # print("Debug: Order updated and saved to memory")
 
     def show_tool_context_menu(self, tool_info_str, global_pos):
         if not self.category_list.currentItem(): return
