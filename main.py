@@ -4,7 +4,7 @@ import json
 import time
 import subprocess
 import threading
-import math
+import configparser
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QLabel, QWidget, 
     QListWidget, QListWidgetItem, QScrollArea, 
@@ -13,9 +13,8 @@ from PyQt5.QtWidgets import (
     QDialog, QLineEdit, QPushButton, QGridLayout, QFileDialog,
     QAbstractItemView
 )
-from PyQt5.QtCore import Qt, QFileInfo, QSize, QPoint, QRect, QTimer
-from PyQt5.QtGui import QPixmap, QFont, QCursor
-import configparser
+from PyQt5.QtCore import Qt, QFileInfo, QPoint, QTimer
+from PyQt5.QtGui import QPixmap, QFont
 
 # 全局配置变量和图标缓存
 USER_CONFIG = {}
@@ -123,14 +122,31 @@ def load_config(current_dir, config_file=".res/config.ini"):
 
 
 # ==========================================
-#      核心组件1：自动居中流式容器 (支持拖拽排序)
+#      核心组件1.1：占位符 (用于显示空位)
+# ==========================================
+class GridPlaceholder(QWidget):
+    """拖拽时用于占位的虚线框"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        cfg = USER_CONFIG["ITEM_CONFIG"]
+        self.setFixedSize(cfg["WIDTH"], cfg["HEIGHT"])
+        self.setStyleSheet("""
+            background-color: rgba(255, 255, 255, 10);
+            border: 2px dashed rgba(255, 255, 255, 50);
+            border-radius: 5px;
+        """)
+        self.show()
+
+
+# ==========================================
+#      核心组件1：自动居中流式容器
 # ==========================================
 class ResponsiveContainer(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.tools = [] # 存储 ToolItem 对象
-        self.parent_win = None # 将在添加时赋值
-        self.current_cols = 1 # 当前列数，用于计算索引
+        self.tools = [] # 存储 ToolItem 或 GridPlaceholder 对象
+        self.parent_win = None
+        self.placeholder = None 
 
     def set_window_instance(self, win):
         self.parent_win = win
@@ -142,8 +158,12 @@ class ResponsiveContainer(QWidget):
         self.update_layout() 
 
     def clear_tools(self):
+        """彻底清除所有工具，防止重影和内存泄漏"""
+        self.placeholder = None
         for btn in self.tools:
-            btn.deleteLater()
+            btn.hide() # 立即隐藏
+            btn.setParent(None) # 断开父子关系
+            btn.deleteLater() # 稍后销毁
         self.tools = []
 
     def resizeEvent(self, event):
@@ -151,7 +171,6 @@ class ResponsiveContainer(QWidget):
         super().resizeEvent(event)
 
     def get_layout_params(self):
-        """获取当前布局参数和起始偏移量"""
         container_width = self.width()
         cfg = USER_CONFIG["ITEM_CONFIG"]
         w = cfg["WIDTH"]
@@ -162,86 +181,105 @@ class ResponsiveContainer(QWidget):
         safe_width = container_width - 20 
         cols = (safe_width + sx) // (w + sx)
         cols = max(1, int(cols))
-        self.current_cols = cols
 
         actual_grid_width = cols * w + (cols - 1) * sx
         start_x = (container_width - actual_grid_width) // 2
         return w, h, sx, sy, cols, start_x
 
-    def update_layout(self, exclude_item=None):
-        """更新所有图标的位置，可排除特定图标(正在拖拽的)"""
-        if not self.tools: return
+    def update_layout(self):
+        """重新计算所有子控件位置"""
+        if not self.tools: 
+            self.setMinimumHeight(20)
+            return
 
         w, h, sx, sy, cols, start_x = self.get_layout_params()
         
-        for i, btn in enumerate(self.tools):
-            # 如果是正在拖拽的图标，跳过它的自动定位
-            if btn == exclude_item:
-                continue
-
+        for i, item in enumerate(self.tools):
             row = i // cols
             col = i % cols
             x = start_x + col * (w + sx)
             y = 10 + row * (h + sy) 
-            
-            # 使用动画或直接移动
-            btn.move(int(x), int(y))
+            item.move(int(x), int(y))
+            item.show()
 
-        # 更新容器总高度
         total_rows = (len(self.tools) - 1) // cols + 1
         total_height = 20 + total_rows * (h + sy)
         self.setMinimumHeight(total_height)
 
     def get_index_at_pos(self, pos):
-        """根据坐标计算应该所在的列表索引 (核心逻辑)"""
+        """计算坐标对应的索引"""
         w, h, sx, sy, cols, start_x = self.get_layout_params()
-        
-        # 简单的网格索引计算
         rel_x = pos.x() - start_x
         rel_y = pos.y() - 10
         
         col = round(rel_x / (w + sx))
         row = round(rel_y / (h + sy))
         
-        # 边界限制
         if col < 0: col = 0
         if col >= cols: col = cols - 1
         if row < 0: row = 0
         
         index = row * cols + col
+        return int(index)
+
+    # --- 占位符操作 ---
+    def add_placeholder_at_index(self, index=-1):
+        """插入一个占位符，若已存在则忽略"""
+        # 防止重复添加
+        if self.placeholder and self.placeholder in self.tools:
+            return 
         
-        # 限制最大索引
-        if index >= len(self.tools):
-            index = len(self.tools) - 1
-        if index < 0:
-            index = 0
-            
-        return index
+        self.placeholder = GridPlaceholder(self)
+        if index == -1 or index >= len(self.tools):
+            self.tools.append(self.placeholder)
+        else:
+            self.tools.insert(index, self.placeholder)
+        self.update_layout()
 
-    def reorder_item(self, item, center_pos):
-        """当拖拽发生时，实时调整列表顺序"""
-        current_index = self.tools.index(item)
-        target_index = self.get_index_at_pos(center_pos)
+    def update_placeholder_position(self, global_mouse_pos):
+        """根据鼠标位置移动占位符"""
+        if not self.placeholder:
+            self.add_placeholder_at_index()
+            return
 
+        local_pos = self.mapFromGlobal(global_mouse_pos)
+        target_index = self.get_index_at_pos(local_pos)
+        
+        # 查找当前占位符的位置
+        try:
+            current_index = self.tools.index(self.placeholder)
+        except ValueError:
+            # 异常情况：占位符丢了，重新加
+            self.add_placeholder_at_index()
+            return
+
+        # 修正目标索引范围
+        if target_index >= len(self.tools):
+            target_index = len(self.tools) - 1
+
+        # 只有位置变了才更新，防抖，防卡死
         if current_index != target_index:
-            # 移动列表中的元素
             self.tools.pop(current_index)
-            self.tools.insert(target_index, item)
-            
-            # 重新布局其他元素（不移动正在拖拽的item）
-            self.update_layout(exclude_item=item)
+            self.tools.insert(target_index, self.placeholder)
+            self.update_layout()
 
-    def finalize_drag(self, item):
-        """拖拽结束，将item吸附到最终格子，并保存数据"""
-        self.update_layout() # 强制所有归位
-        
-        # 通知主窗口保存新的顺序
-        if self.parent_win:
-            self.parent_win.save_tools_order([t.tool_info_str for t in self.tools])
+    def remove_placeholder(self):
+        """移除占位符"""
+        if self.placeholder and self.placeholder in self.tools:
+            self.tools.remove(self.placeholder)
+            self.placeholder.hide()
+            self.placeholder.deleteLater()
+            self.placeholder = None
+            self.update_layout()
+            
+    def get_placeholder_index(self):
+        if self.placeholder and self.placeholder in self.tools:
+            return self.tools.index(self.placeholder)
+        return len(self.tools) # 默认最后
 
 
 # ==========================================
-#      核心组件2：软件图标 (解析与交互 + 拖拽)
+#      核心组件2：软件图标 (修复拖拽重影)
 # ==========================================
 class ToolItem(QWidget):
     def __init__(self, name, desc, path, tool_info_str, parent_win):
@@ -256,9 +294,10 @@ class ToolItem(QWidget):
         self.last_right_click = 0
         self.click_interval = 300 
         
-        # 拖拽相关变量
+        # 拖拽相关
         self.drag_start_pos = None
         self.is_dragging = False
+        self.original_category = None 
         
         cfg = USER_CONFIG["ITEM_CONFIG"]
         self.setFixedSize(cfg["WIDTH"], cfg["HEIGHT"])
@@ -279,7 +318,6 @@ class ToolItem(QWidget):
                 border-radius: 5px;
             }
         """
-        # 拖拽时的样式
         self.style_dragging = """
             QWidget#ToolItem {
                 background: rgba(0, 170, 255, 80);
@@ -364,11 +402,15 @@ class ToolItem(QWidget):
             self.parent_win.update_description("") 
         super().leaveEvent(event)
 
-    # --- 鼠标事件处理 (增加拖拽逻辑) ---
+    # --- 鼠标事件处理 ---
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
-            self.drag_start_pos = event.pos() 
+            self.drag_start_pos = event.globalPos() 
             self.is_dragging = False 
+            
+            # 记录数据
+            current_cat_item = self.parent_win.category_list.currentItem()
+            self.original_category = current_cat_item.text() if current_cat_item else None
             
             current_time = time.time() * 1000
             if current_time - self.last_left_click > self.click_interval:
@@ -387,37 +429,104 @@ class ToolItem(QWidget):
     def mouseMoveEvent(self, event):
         if not (event.buttons() & Qt.LeftButton):
             return
-            
         if not self.drag_start_pos:
             return
 
-        dist = (event.pos() - self.drag_start_pos).manhattanLength()
+        dist = (event.globalPos() - self.drag_start_pos).manhattanLength()
         
-        if not self.is_dragging:
-            if dist > 10:
-                self.is_dragging = True
-                self.setStyleSheet(self.style_dragging)
-                self.raise_() 
+        # 1. 触发拖拽
+        if not self.is_dragging and dist > 10:
+            self.is_dragging = True
+            self.setStyleSheet(self.style_dragging)
+            
+            # 【重要】通知主窗口：这个数据正在被拖动，刷新页面时不要重复渲染它！
+            self.parent_win.dragging_tool_data = self.tool_info_str
+            
+            container = self.parent_win.responsive_container
+            
+            # 获取索引并从列表中移除（逻辑移除）
+            current_index = -1
+            if self in container.tools:
+                current_index = container.tools.index(self)
+                container.tools.remove(self) 
+            
+            # 提升层级到窗口
+            global_pos = self.mapToGlobal(QPoint(0, 0))
+            self.setParent(self.parent_win) 
+            self.move(self.parent_win.mapFromGlobal(global_pos))
+            self.show()
+            
+            # 在原位置添加占位符
+            container.add_placeholder_at_index(current_index)
                 
+        # 2. 拖拽中
         if self.is_dragging:
-            new_pos = self.mapToParent(event.pos()) - self.drag_start_pos
+            # 移动图标
+            delta = event.globalPos() - self.drag_start_pos
+            self.drag_start_pos = event.globalPos()
+            self.move(self.pos() + delta)
             
-            parent_rect = self.parent().rect()
-            if parent_rect.contains(new_pos):
-                 self.move(new_pos)
-            else:
-                self.move(new_pos) 
+            sidebar_list = self.parent_win.category_list
+            container = self.parent_win.responsive_container
             
-            center_pos = self.pos() + QPoint(self.width() // 2, self.height() // 2)
-            self.parent().reorder_item(self, center_pos)
+            # A. 检测侧边栏悬停 (切换分类)
+            local_sb_pos = sidebar_list.mapFromGlobal(event.globalPos())
+            hovered_cat = sidebar_list.itemAt(local_sb_pos)
+            
+            if hovered_cat and hovered_cat != sidebar_list.currentItem():
+                # 切换分类
+                sidebar_list.setCurrentItem(hovered_cat) 
+                # 切换后容器被清空，立即把占位符加回来，让用户看到
+                container.add_placeholder_at_index()
+
+            # B. 内容区更新占位符位置
+            container.update_placeholder_position(event.globalPos())
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.LeftButton:
             if self.is_dragging:
                 self.is_dragging = False
                 self.setStyleSheet(self.style_hover) 
-                self.parent().finalize_drag(self) 
+                
+                # 【重要】拖拽结束，清除标记
+                self.parent_win.dragging_tool_data = None
+                
+                container = self.parent_win.responsive_container
+                final_cat_item = self.parent_win.category_list.currentItem()
+                
+                if final_cat_item:
+                    target_category = final_cat_item.text()
+                    
+                    # 1. 获取占位符的最终位置
+                    target_index = container.get_placeholder_index()
+                    
+                    # 2. 更新内存数据
+                    # 先移除旧的（只移除一个）
+                    if self.original_category and self.original_category in self.parent_win.data:
+                        old_list = self.parent_win.data[self.original_category]
+                        if self.tool_info_str in old_list:
+                            old_list.remove(self.tool_info_str)
+                    
+                    # 再添加到新的
+                    if target_category not in self.parent_win.data:
+                        self.parent_win.data[target_category] = []
+                    
+                    # 安全插入
+                    data_list = self.parent_win.data[target_category]
+                    if target_index >= len(data_list):
+                        data_list.append(self.tool_info_str)
+                    else:
+                        data_list.insert(target_index, self.tool_info_str)
+                    
+                    self.parent_win.is_dirty = True
+                    
+                    # 3. 刷新界面 (这时候 dragging_tool_data 已经是 None，所以会正常加载)
+                    container.remove_placeholder()
+                    self.parent_win.on_category_changed(final_cat_item)
+                
+                self.deleteLater()
             else:
+                # 普通点击
                 current_time = time.time() * 1000
                 if current_time - self.last_left_click < self.click_interval:
                     self.parent_win.launch_app(self.path)
@@ -429,7 +538,6 @@ class ToolItem(QWidget):
 #      核心组件3：软件添加/编辑对话框
 # ==========================================
 class AddEditSoftwareDialog(QDialog):
-    """用于添加和编辑软件信息的对话框"""
     def __init__(self, parent, category, tool_info_str=None):
         super().__init__(parent)
         self.setWindowTitle("添加软件" if not tool_info_str else "编辑软件")
@@ -475,7 +583,10 @@ class AddEditSoftwareDialog(QDialog):
         layout.addWidget(save_btn, 3, 0, 1, 3)
 
     def load_data(self, tool_info_str):
-        name, desc, path = [p.strip() for p in tool_info_str.split("|")]
+        parts = tool_info_str.split("|")
+        name = parts[0].strip() if len(parts) > 0 else ""
+        desc = parts[1].strip() if len(parts) > 1 else ""
+        path = parts[2].strip() if len(parts) > 2 else ""
         self.name_input.setText(name)
         self.desc_input.setText(desc)
         self.path_input.setText(path)
@@ -512,6 +623,8 @@ class MainWindow(QMainWindow):
         self.data_path = "" 
         self.is_dirty = False 
         self.selected_software_info = None 
+        # 【重要】记录当前正在拖动的工具数据，用于去重
+        self.dragging_tool_data = None
         
         self.W = USER_CONFIG.get("WINDOW_WIDTH", 1280)
         self.H = USER_CONFIG.get("WINDOW_HEIGHT", 760)
@@ -562,16 +675,13 @@ class MainWindow(QMainWindow):
         self.category_list.setFocusPolicy(Qt.NoFocus)
         self.category_list.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         
-        # --- 新增: 启用分类列表的拖拽排序 ---
         self.category_list.setDragEnabled(True)
         self.category_list.setAcceptDrops(True)
         self.category_list.setDragDropMode(QAbstractItemView.InternalMove)
         self.category_list.setDefaultDropAction(Qt.MoveAction)
-        # 连接模型移动信号，用于同步数据顺序
         self.category_list.model().rowsMoved.connect(self.on_category_reordered)
 
         cat_f_size = USER_CONFIG["FONT_SIZES"].get("CATEGORY", 15)
-        # --- START OF MODIFICATION: REMOVE :hover STYLE ---
         self.category_list.setStyleSheet(f"""
             QListWidget {{ background: transparent; border: none; outline: 0; }}
             QListWidget::item {{
@@ -583,7 +693,11 @@ class MainWindow(QMainWindow):
                 margin-bottom: 2px;
                 border: none;
             }}
-            /* 移除了 QListWidget::item:hover 样式以避免干扰拖动 */
+            QListWidget::item:hover {{ 
+                color: #ffffff;
+                padding-left: 20px;
+                background: rgba(255,255,255,0.1); 
+            }}
             QListWidget::item:selected {{
                 color: #FFFFFF;
                 font-weight: bold;
@@ -592,7 +706,6 @@ class MainWindow(QMainWindow):
                 color: #00aaff;
             }}
         """)
-        # --- END OF MODIFICATION ---
         self.category_list.currentItemChanged.connect(self.on_category_changed)
         self.category_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.category_list.customContextMenuRequested.connect(self.on_category_context_menu)
@@ -641,7 +754,7 @@ class MainWindow(QMainWindow):
         """)
 
         self.responsive_container = ResponsiveContainer()
-        self.responsive_container.set_window_instance(self) # 关联主窗口实例
+        self.responsive_container.set_window_instance(self) 
         self.responsive_container.setStyleSheet("background: transparent;")
         self.scroll_area.setWidget(self.responsive_container)
 
@@ -678,7 +791,6 @@ class MainWindow(QMainWindow):
         btn_min.setCursor(Qt.PointingHandCursor)
         btn_min.mousePressEvent = lambda e: self.showMinimized()
 
-    # --- 数据加载/保存/关闭 ---
     def load_data(self):
         json_path = os.path.join(self.current_dir, USER_CONFIG.get("JSON_FILE", "data.json"))
         self.data_path = json_path
@@ -691,7 +803,6 @@ class MainWindow(QMainWindow):
             with open(json_path, 'r', encoding='utf-8') as f:
                 self.data = json.load(f)
             
-            # 清空列表防止重载时重复
             self.category_list.clear()
             for category in self.data.keys():
                 item = QListWidgetItem(category)
@@ -737,13 +848,20 @@ class MainWindow(QMainWindow):
         else:
             event.accept()
 
-    # --- 分类管理方法 ---
     def on_category_changed(self, item):
         if not item: return
         self.responsive_container.clear_tools()
         tools = self.data.get(item.text(), [])
         
+        skipped_one_drag = False
+
         for tool_str in tools:
+            # 【重要】去重逻辑：如果该工具正在被拖拽，且未被跳过一次，则不加载它
+            # 使用 skipped_one_drag 是为了防止有重复的工具只隐藏一个
+            if self.dragging_tool_data and tool_str == self.dragging_tool_data and not skipped_one_drag:
+                skipped_one_drag = True
+                continue
+            
             parts = tool_str.split("|")
             if len(parts) >= 3:
                 name = parts[0].strip()
@@ -754,17 +872,13 @@ class MainWindow(QMainWindow):
                 self.responsive_container.add_tool(btn)
     
     def on_category_reordered(self, parent, start, end, destination, row):
-        """当分类被拖动重新排序后，同步内存数据顺序"""
         new_data = {}
-        # 遍历 ListWidget 的当前顺序来重建字典
         for i in range(self.category_list.count()):
             cat_name = self.category_list.item(i).text()
             if cat_name in self.data:
                 new_data[cat_name] = self.data[cat_name]
-        
         self.data = new_data
         self.is_dirty = True
-        # print("Debug: Category order synced.")
 
     def on_category_context_menu(self, point):
         item = self.category_list.itemAt(point)
@@ -804,8 +918,6 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "警告", "新分类名称已存在！")
                 return
             
-            # 使用有序字典方式保持原位置（简单实现为重新插入，稍微改变底层顺序，但界面已改）
-            # 最好的方式是直接替换Key但保持顺序
             new_data = {}
             for k, v in self.data.items():
                 if k == old_category:
@@ -832,16 +944,6 @@ class MainWindow(QMainWindow):
             self.responsive_container.clear_tools()
             self.update_description("")
             
-    # --- 软件管理方法 ---
-    def save_tools_order(self, new_tools_list):
-        current_item = self.category_list.currentItem()
-        if not current_item: return
-        
-        category = current_item.text()
-        if category in self.data:
-            self.data[category] = new_tools_list
-            self.is_dirty = True
-
     def show_tool_context_menu(self, tool_info_str, global_pos):
         if not self.category_list.currentItem(): return
 
@@ -885,7 +987,6 @@ class MainWindow(QMainWindow):
             else:
                  QMessageBox.warning(self, "错误", "未能找到原软件信息进行更新！")
 
-
     def delete_software(self, tool_info_str):
         current_item = self.category_list.currentItem()
         if not current_item: return
@@ -913,7 +1014,6 @@ class MainWindow(QMainWindow):
             else:
                  QMessageBox.warning(self, "错误", "未能找到该软件进行删除！")
 
-    # --- 运行/操作方法 ---
     def update_description(self, text):
         self.desc_label.setText(text)
 
